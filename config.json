@@ -41,6 +41,7 @@
   "limit_fallback_to_market": true,
   "market_max_attempts": 3,
   "market_wait_seconds": 10,
+  "verify_position_before_close": true,
 
   "upstox": {
     "base_url_v2": "https://api.upstox.com/v2",

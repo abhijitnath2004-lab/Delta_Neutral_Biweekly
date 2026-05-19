@@ -69,6 +69,14 @@ class DeltaNeutralStrategy:
         self.mkt_attempts = int(cfg.get("market_max_attempts", 3))
         self.mkt_wait = float(cfg.get("market_wait_seconds", 10))
 
+        # Defensive: before placing any closing order, verify the broker still
+        # shows our expected position. If the leg has been closed/reduced
+        # externally (e.g. user manual intervention), skip the close so we
+        # don't accidentally open a brand-new opposite position.
+        self.verify_position_before_close = bool(
+            cfg.get("verify_position_before_close", True)
+        )
+
     # =========================================================
     # PUBLIC ENTRY POINT
     # =========================================================
@@ -153,7 +161,12 @@ class DeltaNeutralStrategy:
         )
 
         # ---- 5: place orders -- LIMIT-with-retry. Hedges first, then shorts ----
-        legs = self._open_iron_condor(ce_short, ce_hedge, pe_short, pe_hedge)
+        # Per-trade tag goes on every order placed for this trade. Lets you
+        # filter the bot's orders in the Upstox order book and pin every order
+        # back to a specific trade. Upstox tag field caps at 20 chars.
+        trade_id = f"DN_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        tag = (f"DN_{now.strftime('%y%m%d_%H%M')}_{uuid.uuid4().hex[:3]}")[:20]
+        legs = self._open_iron_condor(ce_short, ce_hedge, pe_short, pe_hedge, tag=tag)
 
         # Realized credit using ACTUAL fills
         actual_credit_per_unit = (
@@ -163,7 +176,8 @@ class DeltaNeutralStrategy:
         actual_credit_total = actual_credit_per_unit * self.qty
 
         state = {
-            "trade_id": f"DN_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+            "trade_id": trade_id,
+            "tag": tag,
             "entry_dt": now.isoformat(),
             "expiry_date": expiry_str,
             "spot_at_entry": spot,
@@ -288,14 +302,17 @@ class DeltaNeutralStrategy:
 
     def _reset_side(self, state, side: str, chain) -> None:
         """F: First close existing strikes with MARKET orders, then place
-        the new sell + hedge using LIMIT-with-retry."""
+        the new sell + hedge using LIMIT-with-retry. All orders carry the
+        trade's tag so the new redeploys are traceable to the same trade."""
         legs = state["legs"]
+        tag = state.get("tag", "delta_neutral")
         short_key = "ce_short" if side == "CE" else "pe_short"
         hedge_key = "ce_hedge" if side == "CE" else "pe_hedge"
 
-        # 1) Close existing -- MARKET (fast, certain)
-        self._close_leg(legs[short_key])
-        self._close_leg(legs[hedge_key])
+        # 1) Close existing -- MARKET (fast, certain). Position-existence check
+        # is built into _close_leg so user-side manual closures are safe.
+        self._close_leg(legs[short_key], tag)
+        self._close_leg(legs[hedge_key], tag)
 
         # 2) Pick fresh 0.20Δ short on 100-strikes
         new_short = self._pick_by_delta(chain, side, self.target_delta)
@@ -311,8 +328,8 @@ class DeltaNeutralStrategy:
             return
 
         # 3) Open new -- LIMIT-with-retry. Hedge first, then short.
-        h_res = self._place_limit_open(new_hedge["instrument_key"], "BUY")
-        s_res = self._place_limit_open(new_short["instrument_key"], "SELL")
+        h_res = self._place_limit_open(new_hedge["instrument_key"], "BUY", tag)
+        s_res = self._place_limit_open(new_short["instrument_key"], "SELL", tag)
 
         legs[short_key] = self._make_leg(new_short, "SELL", side, fill=s_res)
         legs[hedge_key] = self._make_leg(new_hedge, "BUY",  side, fill=h_res)
@@ -325,12 +342,12 @@ class DeltaNeutralStrategy:
     # =========================================================
     # ORDER HELPERS
     # =========================================================
-    def _open_iron_condor(self, ce_s, ce_h, pe_s, pe_h) -> Dict[str, Any]:
+    def _open_iron_condor(self, ce_s, ce_h, pe_s, pe_h, tag: str) -> Dict[str, Any]:
         # Hedges first (long protection establishes margin), then shorts.
-        ch_res = self._place_limit_open(ce_h["instrument_key"], "BUY")
-        ph_res = self._place_limit_open(pe_h["instrument_key"], "BUY")
-        cs_res = self._place_limit_open(ce_s["instrument_key"], "SELL")
-        ps_res = self._place_limit_open(pe_s["instrument_key"], "SELL")
+        ch_res = self._place_limit_open(ce_h["instrument_key"], "BUY", tag)
+        ph_res = self._place_limit_open(pe_h["instrument_key"], "BUY", tag)
+        cs_res = self._place_limit_open(ce_s["instrument_key"], "SELL", tag)
+        ps_res = self._place_limit_open(pe_s["instrument_key"], "SELL", tag)
         return {
             "ce_short": self._make_leg(ce_s, "SELL", "CE", fill=cs_res),
             "ce_hedge": self._make_leg(ce_h, "BUY",  "CE", fill=ch_res),
@@ -338,40 +355,109 @@ class DeltaNeutralStrategy:
             "pe_hedge": self._make_leg(pe_h, "BUY",  "PE", fill=ph_res),
         }
 
-    def _place_limit_open(self, instrument_key: str, side: str):
+    def _place_limit_open(self, instrument_key: str, side: str, tag: str):
         return self.client.place_limit_with_retry(
             instrument_key=instrument_key, side=side, quantity=self.qty,
             max_attempts=self.lim_attempts, wait_seconds=self.lim_wait,
             product=self.product, tick_size=self.tick_size,
             fallback_to_market=self.lim_fallback,
             market_fallback_attempts=self.mkt_attempts,
+            tag=tag,
         )
 
     def _close_all(self, state, reason: str) -> None:
+        """Close ONLY the legs the bot itself opened (those listed in
+        state['legs']). This intentionally never queries broker positions for
+        a 'close all' sweep -- any manual trades you have running on other
+        instruments (or even on the same instrument as additional contracts)
+        are NOT touched by this method."""
         self.log.info("Closing trade %s reason=%s", state["trade_id"], reason)
+        tag = state.get("tag", "delta_neutral")
         for leg in state["legs"].values():
-            self._close_leg(leg)
+            self._close_leg(leg, tag)
         self.state_mgr.close_trade(state, reason)
 
-    def _close_leg(self, leg: Dict[str, Any]) -> None:
-        """Close a leg with a MARKET order (E + F: closes are always MARKET).
-        Tracks partial fills the same way opens do."""
+    def _close_leg(self, leg: Dict[str, Any], tag: str) -> None:
+        """Close a leg with a MARKET order (closes are always MARKET).
+        Skips with a clear log line if the broker no longer shows our expected
+        position (e.g. user manually closed it from the Upstox app). Tracks
+        partial fills the same way opens do."""
+        if self.verify_position_before_close and not self._verify_position_exists(leg):
+            leg["close_status"] = "SKIPPED_POSITION_NOT_FOUND"
+            leg["close_status_at"] = datetime.utcnow().isoformat() + "Z"
+            return
+
         opp = "BUY" if leg["side"] == "SELL" else "SELL"
         try:
             res = self.client.place_market_and_fill(
                 instrument_key=leg["instrument_key"], side=opp, quantity=leg["qty"],
                 product=self.product, max_attempts=self.mkt_attempts,
-                wait_seconds=self.mkt_wait,
+                wait_seconds=self.mkt_wait, tag=tag,
             )
             leg["exit_order_id"] = res.order_id
             leg["exit_filled_qty"] = res.filled_qty
             if res.avg_price is not None:
                 leg["exit_price"] = res.avg_price
+            leg["close_status"] = (
+                "CLOSED" if res.filled_qty >= leg["qty"] else "PARTIALLY_CLOSED"
+            )
             if res.filled_qty < leg["qty"]:
                 self.log.error("Leg %s only partially closed: %d/%d. Manual reconciliation needed.",
                                leg["instrument_key"], res.filled_qty, leg["qty"])
         except Exception as e:
             self.log.error("Failed to close leg %s: %s", leg["instrument_key"], e)
+            leg["close_status"] = "ERROR"
+
+    def _verify_position_exists(self, leg: Dict[str, Any]) -> bool:
+        """Confirm the broker still shows the bot's expected position before
+        closing. Returns True (allow close) if positions API is unreachable;
+        returns False if the leg's specific instrument shows less than the
+        bot's expected size (i.e. it was closed/reduced externally).
+
+        Note: positions are netted at the broker. If you are also TRADING the
+        same instrument manually (adding to the bot's short, say), the netted
+        size is MORE negative than expected, so the check still passes and the
+        bot's BUY-to-close just unwinds its own qty -- your manual position
+        stays intact.
+        """
+        try:
+            positions = self.client.get_positions()
+        except Exception as e:
+            self.log.warning(
+                "Position verification failed (%s). Proceeding with close as a fallback.", e,
+            )
+            return True
+
+        ik = leg["instrument_key"]
+        expected_side = leg["side"]              # "SELL" or "BUY"
+        expected_qty = int(leg["qty"])
+
+        for p in positions:
+            pkey = p.get("instrument_token") or p.get("instrument_key")
+            if pkey != ik:
+                continue
+            qty_signed = int(p.get("quantity") or 0)
+            if expected_side == "SELL":
+                ok = qty_signed <= -expected_qty
+            else:
+                ok = qty_signed >= expected_qty
+            if ok:
+                return True
+            self.log.error(
+                "POSITION DRIFT on %s: expected %s %d (signed %d), broker shows %d. "
+                "Skipping bot close to avoid opening a new opposite position. "
+                "Reconcile manually.",
+                ik, expected_side, expected_qty,
+                -expected_qty if expected_side == "SELL" else expected_qty, qty_signed,
+            )
+            return False
+
+        self.log.error(
+            "POSITION NOT FOUND at broker: %s (expected %s %d). "
+            "Likely closed externally. Skipping bot close.",
+            ik, expected_side, expected_qty,
+        )
+        return False
 
     def _make_leg(self, picked, side, opt_type, fill=None) -> Dict[str, Any]:
         """Build a leg dict using the FillResult (preferred) or fall back to LTP.

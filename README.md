@@ -102,6 +102,53 @@ python main.py --status   # print the active trade JSON
 - On close the file is renamed to `state/closed_trades/<trade_id>_<reason>_<timestamp>.json`.
 - If you restart the bot mid-trade, it loads the active state and resumes monitoring -- no re-entry while a trade is open.
 
+## Order isolation (your manual trades are safe)
+
+The bot is engineered to coexist with manual trades you have running on the same Upstox account. Two layers protect that:
+
+### 1. Per-trade order tag
+Every order the bot places carries `tag = "<short trade id>"` (e.g. `DN_260520_1500_a1b`, ≤20 chars to fit Upstox's tag field). The trade tag is generated at entry, persisted as `state.tag`, and reused for every redeploy/close belonging to that trade. You can filter the Upstox order book by this tag to see only the bot's orders for a given trade and tell them apart from your manual ones.
+
+### 2. Closes only the bot's tracked legs -- never a "close all" sweep
+`_close_all` iterates only `state["legs"].values()` -- the **four specific instrument keys** the bot has recorded for the current trade. It does not call `get_positions()` to find and close everything. Any manual trade you have on different strikes, expiries, or symbols is invisible to this loop and is **not** touched.
+
+For the unusual case where you've manually altered one of those four exact instruments, a defensive **position-existence check** runs before each close (toggle: `verify_position_before_close`):
+
+| Broker shows for that instrument | Bot decision |
+|---|---|
+| `≤ -65` (we shorted 65; broker shows our short, possibly plus your extra short) | **Closes 65** -- your extra position untouched |
+| `-65` exactly | **Closes 65** -- normal happy path |
+| `-30` (you manually closed part of the bot's leg) | **Skips**, marks the leg `SKIPPED_POSITION_NOT_FOUND`, logs an ERROR -- never blindly opens a new long |
+| `0` or position absent (you manually closed the whole leg) | **Skips**, same as above |
+| Positions API unreachable | Fails open: closes the leg using state's qty (logged as a warning) |
+
+If the check skips a close, the leg is annotated in state with `close_status: "SKIPPED_POSITION_NOT_FOUND"` and a timestamp, the trade is still archived to `state/closed_trades/`, and you reconcile manually.
+
+### What's recorded per leg in state JSON
+
+```jsonc
+{
+  "instrument_key":  "NSE_FO|...",
+  "tradingsymbol":   "NIFTY...CE",
+  "strike":          24800,
+  "option_type":     "CE",
+  "side":            "SELL",
+  "qty":             65,         // actual filled
+  "intended_qty":    65,         // what we asked for
+  "qty_shortfall":   0,
+  "entry_price":     42.55,      // weighted-avg fill from /v2/order/details
+  "entry_delta":     0.20,
+  "current_price":   38.10,
+  "current_delta":   0.18,
+  "entry_order_id":  "230516010305011",
+  // post-close:
+  "exit_order_id":   "230516010305112",
+  "exit_filled_qty": 65,
+  "exit_price":      18.30,
+  "close_status":    "CLOSED"    // or "PARTIALLY_CLOSED" / "SKIPPED_POSITION_NOT_FOUND" / "ERROR"
+}
+```
+
 ## Tunables of note
 
 | Key | Default | What it controls |
