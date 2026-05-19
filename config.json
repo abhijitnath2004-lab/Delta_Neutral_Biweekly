@@ -46,7 +46,8 @@
   "upstox": {
     "base_url_v2": "https://api.upstox.com/v2",
     "base_url_v3": "https://api.upstox.com/v3",
-    "access_token_env": "UPSTOX_ACCESS_TOKEN",
+    "access_token_file": "/home/opc/TOKEN/upstox_token.txt",
+    "access_token_env":  "UPSTOX_ACCESS_TOKEN",
     "endpoints": {
       "option_chain":  {"version": "v2", "path": "/option/chain"},
       "market_quote":  {"version": "v2", "path": "/market-quote/quotes"},

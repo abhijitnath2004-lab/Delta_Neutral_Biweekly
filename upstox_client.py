@@ -44,18 +44,78 @@ class UpstoxClient:
         self.base_v2 = ux["base_url_v2"].rstrip("/")
         self.base_v3 = ux["base_url_v3"].rstrip("/")
         self.endpoints = ux["endpoints"]
-        token = os.environ.get(ux["access_token_env"])
-        if not token:
-            raise UpstoxError(
-                f"Set Upstox access token in env var {ux['access_token_env']}"
-            )
-        self._headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
+
+        # Token loading: prefer a file path (the user runs a daily token
+        # generator that writes to e.g. /home/opc/TOKEN/upstox_token.txt) but
+        # fall back to an environment variable for dev / CI environments.
+        # The file's mtime is tracked so a fresh token written next morning
+        # is picked up automatically without restarting the bot.
+        self._token_file = ux.get("access_token_file") or None
+        self._token_env  = ux.get("access_token_env")  or None
+        self._token_mtime: Optional[float] = None
+        self._token: str = self._load_token()
+
         self._sess = requests.Session()
         self._fill_attempts = int(ux.get("fill_poll_attempts", 5))
         self._fill_delay = float(ux.get("fill_poll_delay_seconds", 1.0))
+
+    # ---------------------------------------------------------
+    # Token loading + auto-refresh
+    # ---------------------------------------------------------
+    def _load_token(self) -> str:
+        """Read the access token from the configured file (preferred) or env
+        var (fallback). Updates the cached file mtime when the file is used."""
+        if self._token_file:
+            path = os.path.expanduser(self._token_file)
+            try:
+                with open(path, "r") as f:
+                    token = f.read().strip()
+                if token:
+                    try:
+                        self._token_mtime = os.path.getmtime(path)
+                    except OSError:
+                        self._token_mtime = None
+                    self.log.info("Loaded Upstox access token from %s", path)
+                    return token
+                self.log.warning("Token file %s is empty; falling back to env var.", path)
+            except FileNotFoundError:
+                self.log.warning("Token file %s not found; falling back to env var.", path)
+            except Exception as e:
+                self.log.warning("Failed to read token file %s: %s", path, e)
+
+        if self._token_env:
+            token = os.environ.get(self._token_env)
+            if token:
+                self.log.info("Loaded Upstox access token from env var %s", self._token_env)
+                return token
+
+        raise UpstoxError(
+            f"No Upstox access token found. Tried file '{self._token_file}' "
+            f"and env var '{self._token_env}'."
+        )
+
+    def _maybe_refresh_token(self) -> None:
+        """If the token file has been rewritten since we last read it (e.g. by
+        the daily morning token generator), reload it transparently."""
+        if not self._token_file:
+            return
+        path = os.path.expanduser(self._token_file)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if self._token_mtime is None or mtime > self._token_mtime:
+            self.log.info("Token file mtime changed; reloading access token.")
+            try:
+                self._token = self._load_token()
+            except Exception as e:
+                self.log.error("Token reload failed: %s (continuing with previous token)", e)
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._token}",
+        }
 
     # =========================================================
     # internal: route to v2 or v3
@@ -68,10 +128,29 @@ class UpstoxClient:
         return self.endpoints[ep_key]["path"]
 
     def _request(self, method: str, ep_key: str, **kwargs) -> Dict[str, Any]:
+        # Pick up a freshly-rotated token file if the morning generator has run.
+        self._maybe_refresh_token()
         url = f"{self._base_for(ep_key)}{self._path_for(ep_key)}"
+        reloaded_on_401 = False
         for attempt in range(3):
             try:
-                r = self._sess.request(method, url, headers=self._headers, timeout=15, **kwargs)
+                r = self._sess.request(method, url, headers=self._auth_headers(),
+                                       timeout=15, **kwargs)
+                # Token expired / unauthorized -- force a reload from disk
+                # and retry exactly once with the fresh token.
+                if r.status_code == 401 and not reloaded_on_401:
+                    self.log.warning(
+                        "Upstox returned 401 on %s %s; reloading token and retrying once.",
+                        method, ep_key,
+                    )
+                    try:
+                        self._token = self._load_token()
+                        self._token_mtime = None  # force re-stat next time
+                    except Exception as e:
+                        self.log.error("Token reload after 401 failed: %s", e)
+                        raise UpstoxError(f"401 unauthorized and token reload failed: {e}")
+                    reloaded_on_401 = True
+                    continue
                 if r.status_code >= 500:
                     raise UpstoxError(f"{r.status_code}: {r.text[:200]}")
                 if r.status_code == 429:

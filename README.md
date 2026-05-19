@@ -89,10 +89,57 @@ state/
 
 ```bash
 pip install -r requirements.txt
-export UPSTOX_ACCESS_TOKEN=<your_token>
+```
+
+### Token (Alma Linux on Oracle Cloud)
+The bot reads the Upstox access token from a **file** that your daily token-generator writes before market open. The default path is:
+
+```
+/home/opc/TOKEN/upstox_token.txt
+```
+
+Override via `config.upstox.access_token_file` if you store it elsewhere. The file is read on startup, on every API request (cheap stat call), and again automatically whenever the file's mtime changes — so when the morning generator overwrites the file, the bot picks up the new token without restarting.
+
+If Upstox returns a `401 Unauthorized`, the bot also force-reloads the token from disk and retries the request once.
+
+If the file is missing or empty, the client falls back to the env var named in `config.upstox.access_token_env` (default `UPSTOX_ACCESS_TOKEN`), so you can still run the bot on a dev machine with `export UPSTOX_ACCESS_TOKEN=...`.
+
+```bash
+# Production (Alma Linux): your generator writes /home/opc/TOKEN/upstox_token.txt
 python main.py            # live loop (5-min candle-aligned ticks)
+
+# Dev / one-off
+export UPSTOX_ACCESS_TOKEN=<your_token>
 python main.py --once     # single tick
 python main.py --status   # print the active trade JSON
+```
+
+### Suggested systemd unit (Alma Linux)
+```ini
+# /etc/systemd/system/delta-neutral-bot.service
+[Unit]
+Description=Bi-Weekly Delta Neutral NIFTY Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/Delta_Neutral_Biweekly
+ExecStart=/usr/bin/python3 main.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/opc/Delta_Neutral_Biweekly/logs/stdout.log
+StandardError=append:/home/opc/Delta_Neutral_Biweekly/logs/stderr.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now delta-neutral-bot
+sudo systemctl status delta-neutral-bot
+journalctl -u delta-neutral-bot -f
 ```
 
 ## State awareness
