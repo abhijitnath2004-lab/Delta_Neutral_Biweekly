@@ -205,6 +205,7 @@ class DeltaNeutralStrategy:
         )
         self.log.info("Trade opened: %s (filled credit/unit=%.2f)",
                       state["trade_id"], actual_credit_per_unit)
+        self._log_monitor_snapshot(state, pnl=0.0)
 
     # =========================================================
     # MONITORING
@@ -222,8 +223,7 @@ class DeltaNeutralStrategy:
             leg["current_delta"] = row["delta"]
 
         pnl = self._compute_pnl(state)
-        self.log.info("Monitor: %s pnl=%.2f target=%.2f sl=%.2f",
-                      state["trade_id"], pnl, state["target_pnl"], state["stop_loss_pnl"])
+        self._log_monitor_snapshot(state, pnl)
 
         # Exit gates -- priority order. SL is HARD: no rolls, no adjustments.
         if pnl >= state["target_pnl"]:
@@ -375,6 +375,8 @@ class DeltaNeutralStrategy:
         tag = state.get("tag", "delta_neutral")
         for leg in state["legs"].values():
             self._close_leg(leg, tag)
+        # Final snapshot so the terminal shows the closing P&L line as well.
+        self._log_monitor_snapshot(state, pnl=self._compute_pnl(state))
         self.state_mgr.close_trade(state, reason)
 
     def _close_leg(self, leg: Dict[str, Any], tag: str) -> None:
@@ -622,3 +624,57 @@ class DeltaNeutralStrategy:
             else:
                 pnl += (cur - entry) * leg["qty"]
         return pnl
+
+    @staticmethod
+    def _leg_pnl(leg: Dict[str, Any]) -> float:
+        entry = float(leg["entry_price"])
+        cur = float(leg.get("current_price", entry))
+        if leg["side"] == "SELL":
+            return (entry - cur) * leg["qty"]
+        return (cur - entry) * leg["qty"]
+
+    def _log_monitor_snapshot(self, state: Dict[str, Any], pnl: float) -> None:
+        """Compact multi-line snapshot printed each tick.
+
+        Shows running P&L vs target / stop-loss and one line per leg with the
+        strike, current delta (with entry delta in parentheses for the sold
+        legs since their delta drift drives every adjustment rule), premium
+        move (entry -> current), and per-leg P&L.
+        """
+        legs = state["legs"]
+        ce_s, pe_s = legs["ce_short"], legs["pe_short"]
+        ce_h, pe_h = legs["ce_hedge"], legs["pe_hedge"]
+        target = state["target_pnl"]
+        sl = state["stop_loss_pnl"]
+
+        self.log.info("-" * 78)
+        self.log.info(
+            "Monitor %s  PnL=%+10.2f   target=+%-9.2f  SL=-%-9.2f  deployed=%.0f",
+            state["trade_id"], pnl, target, sl, state["capital_deployed"],
+        )
+
+        def _fmt_short(name: str, leg: Dict[str, Any]) -> str:
+            cur_d = leg.get("current_delta", leg["entry_delta"])
+            cur_p = leg.get("current_price", leg["entry_price"])
+            return (
+                f"  {name} {leg['option_type']} {leg['strike']:>6}"
+                f"  delta={cur_d:+.3f} (entry {leg['entry_delta']:+.3f})"
+                f"  prem={leg['entry_price']:>6.2f} -> {cur_p:>6.2f}"
+                f"  legPnL={self._leg_pnl(leg):+9.2f}"
+            )
+
+        def _fmt_hedge(name: str, leg: Dict[str, Any]) -> str:
+            cur_d = leg.get("current_delta", leg["entry_delta"])
+            cur_p = leg.get("current_price", leg["entry_price"])
+            return (
+                f"  {name} {leg['option_type']} {leg['strike']:>6}"
+                f"  delta={cur_d:+.3f}                   "
+                f"  prem={leg['entry_price']:>6.2f} -> {cur_p:>6.2f}"
+                f"  legPnL={self._leg_pnl(leg):+9.2f}"
+            )
+
+        # Sell legs first (their deltas drive adjustments)
+        self.log.info(_fmt_short("SELL", ce_s))
+        self.log.info(_fmt_short("SELL", pe_s))
+        self.log.info(_fmt_hedge("BUY ", ce_h))
+        self.log.info(_fmt_hedge("BUY ", pe_h))
