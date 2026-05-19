@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+logs/
+state/active_trade.json
+state/active_trade.json.tmp
+.DS_Store
+.idea/
+.vscode/

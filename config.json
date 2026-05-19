@@ -1,0 +1,46 @@
+{
+  "capital": 1000000,
+
+  "lot_size": 65,
+  "num_lots": 1,
+
+  "target_delta": 0.20,
+  "delta_tolerance": 0.02,
+  "max_delta_threshold": 0.35,
+  "hedge_distance_points": 200,
+  "delta_imbalance_ratio": 2.0,
+  "premium_decay_pct": 50.0,
+
+  "min_net_credit_pct": 3.5,
+  "target_profit_pct": 1.0,
+  "stop_loss_pct": 1.0,
+
+  "vix_threshold": 14.0,
+
+  "entry_day": "Wednesday",
+  "entry_time": "15:00",
+  "exit_day": "Friday",
+  "exit_time": "15:00",
+  "max_holding_sessions": 8,
+
+  "expiry_offset_weeks": 2,
+
+  "underlying_symbol": "NIFTY",
+  "underlying_instrument_key": "NSE_INDEX|Nifty 50",
+  "vix_instrument_key": "NSE_INDEX|India VIX",
+  "exchange": "NFO",
+  "product": "NRML",
+  "order_type": "MARKET",
+
+  "upstox": {
+    "base_url": "https://api.upstox.com/v2",
+    "access_token_env": "UPSTOX_ACCESS_TOKEN"
+  },
+
+  "poll_interval_seconds": 30,
+  "monitor_interval_seconds": 60,
+
+  "state_file": "state/active_trade.json",
+  "closed_trades_dir": "state/closed_trades",
+  "log_file": "logs/strategy.log"
+}
