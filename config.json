@@ -30,7 +30,15 @@
   "vix_instrument_key": "NSE_INDEX|India VIX",
   "exchange": "NFO",
   "product": "D",
-  "order_type": "MARKET",
+
+  "strike_step": 100,
+  "min_delta_floor": 0.10,
+  "premium_balance_tolerance_pct": 5.0,
+  "tick_size": 0.05,
+
+  "limit_max_attempts": 5,
+  "limit_wait_seconds": 60,
+  "limit_fallback_to_market": true,
 
   "upstox": {
     "base_url_v2": "https://api.upstox.com/v2",
@@ -41,6 +49,7 @@
       "market_quote":  {"version": "v2", "path": "/market-quote/quotes"},
       "ltp":           {"version": "v2", "path": "/market-quote/ltp"},
       "place_order":   {"version": "v3", "path": "/order/place"},
+      "cancel_order":  {"version": "v3", "path": "/order/cancel"},
       "order_details": {"version": "v2", "path": "/order/details"},
       "positions":     {"version": "v2", "path": "/portfolio/short-term-positions"}
     },
@@ -51,7 +60,7 @@
   "monitor_interval_minutes": 5,
   "monitor_window_start": "09:20",
   "monitor_window_end":   "15:25",
-  "tick_buffer_seconds":  3,
+  "tick_buffer_seconds":  7,
 
   "state_file": "state/active_trade.json",
   "closed_trades_dir": "state/closed_trades",

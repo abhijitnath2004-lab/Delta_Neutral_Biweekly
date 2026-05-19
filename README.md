@@ -1,7 +1,7 @@
 # Bi-Weekly Delta Neutral NIFTY Strategy (Upstox)
 
 A state-aware bot that runs a bi-weekly delta-neutral iron-condor on NIFTY weekly
-options via the Upstox v2 API.
+options via the Upstox API.
 
 ## Strategy summary
 
@@ -12,58 +12,48 @@ options via the Upstox v2 API.
 | **Expiry** | Tuesday (next-to-next week) |
 | **Entry day / time** | Wednesday 15:00 IST |
 | **Entry guard** | INDIA VIX < 14 |
-| **Position** | Sell 0.20 delta CE & PE; buy hedges 200 pts away |
+| **Position** | Sell 0.20 delta CE & PE (premium-matched); buy hedges 200 pts away |
+| **Strike grid** | 100-spaced only (skip illiquid 50-strikes) |
 | **Min credit** | >= 3.5% of capital deployed |
-| **Target / SL** | +1% / -1% of deployed capital |
-| **Time exit** | Friday 15:00 (or 6 trading sessions, whichever first) |
+| **Target** | +1% of deployed capital → MARKET square-off |
+| **Stop loss** | -1% of deployed capital → **HARD** MARKET square-off |
+| **Time exit** | Friday 15:00 (or `max_holding_sessions`) → MARKET square-off |
 
-> **Hard SL.** The 1% stop-loss is treated as a *hard* kill switch. If breached, **all** legs (both shorts and both hedges) are squared off immediately. No adjustment, no roll, no second-guess.
+> **Hard SL.** The 1% stop-loss is treated as a *hard* kill switch. If breached, **all** legs (both shorts and both hedges) are squared off **immediately with MARKET orders**. No adjustment, no roll, no second-guess.
 
-### Adjustments
-1. **Premium-double / delta imbalance** -- if one short delta exceeds 2x the other, book that side + its hedge and redeploy at 0.20 delta + 200pt hedge.
-2. **Delta cap 0.35** -- if any short delta crosses 0.35, square off that side + hedge and redeploy at 0.20 delta + 200pt hedge.
-3. **Premium decay >= 50%** -- if a short premium has decayed by half or more, roll the short + hedge to a fresh 0.20 delta + 200pt hedge.
+### Entry strike selection
+1. Pick the 0.20Δ CE and PE strikes — restricted to **100-spaced** strikes only.
+2. **Premium balance:** anchor to the side with the lower premium. Walk the richer side further OTM (still on 100-strikes, with a `min_delta_floor` of 0.10) until premiums are roughly matched. Example: PE 0.20Δ ₹40, CE 0.20Δ ₹55 → CE is shifted further OTM until its premium is also near ₹40.
+3. Hedges 200 points beyond the (possibly-shifted) shorts, snapped to the nearest 100-strike.
+4. Net credit must be ≥ 3.5% of `(spread_width_CE + spread_width_PE) × qty` else entry is skipped.
 
-## File layout
+### Order placement
+| Action | Order type | Why |
+|---|---|---|
+| Open / re-open a leg | **LIMIT** at bid-ask mid, retried | Bid-ask is wide on the next-to-next-week expiry; market orders would slip badly. |
+| Close a leg (target / SL / time exit) | **MARKET** | Execution certainty matters more than price. |
+| Adjustment close (close challenged short + its hedge) | **MARKET** | Same reason. |
+| Adjustment re-open (new short + new hedge) | **LIMIT** at bid-ask mid, retried | Same reason as fresh entry. |
 
-```
-config.json              # Strikes, lot, SL, target, deltas, hedge distance, VIX gate, etc.
-main.py                  # Runner / scheduler
-strategy.py              # Entry, exit, adjustment logic
-upstox_client.py         # Upstox v2 API wrapper
-state_manager.py         # JSON state persistence + archive on close
-utils/
-  time_utils.py          # IST clock, Tuesday-expiry math, trading sessions
-  logger.py
-state/
-  active_trade.json      # Live trade. Renamed on close.
-  closed_trades/         # Archive
-```
+The LIMIT helper:
+1. Reads top-of-book bid/ask via `/v2/market-quote/quotes`.
+2. Places a LIMIT at `(bid + ask) / 2`, rounded to the NSE 0.05 tick.
+3. Polls `/v2/order/details` for up to `limit_wait_seconds` (default 60s).
+4. If unfilled, cancels via `/v3/order/cancel`, refreshes bid/ask, re-prices, and re-places.
+5. After `limit_max_attempts` unfilled tries (default 5), falls back to a MARKET order so execution is guaranteed.
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-export UPSTOX_ACCESS_TOKEN=<your_token>
-```
-
-Edit `config.json` to set your `capital`, `num_lots`, etc.
-
-## Run
-
-```bash
-python main.py            # live loop (5-min candle-aligned ticks)
-python main.py --once     # single tick (use from cron)
-python main.py --status   # show active trade
-```
+### Adjustments (continuously checked when no exit gate fires)
+1. **Premium-double / delta imbalance** — if one short delta exceeds 2× the other, MARKET-close that side + its hedge and LIMIT-redeploy at 0.20Δ + 200pt hedge.
+2. **Delta cap 0.35** — same flow.
+3. **Premium decay ≥ 50%** — same flow.
 
 ## Scheduling
 
 The bot runs in a candle-aligned loop:
 
-- Wakes up at every 5-minute boundary (`:20, :25, :30, ..., :25:00`) plus a small `tick_buffer_seconds` (default 3s) so Upstox feeds have settled.
-- **Skips the 9:15 and 15:30 candles** by enforcing a monitor window of `09:20`–`15:25` IST. These candles are excluded from both monitoring and entry decisions because their data is unreliable.
-- Outside the window or on weekends/holidays, it sleeps until the next trading day's `09:20`.
+- Wakes up at every 5-minute boundary (`:20, :25, :30, …, :15:00, …, :25:00`) plus a `tick_buffer_seconds` of **7 seconds** so Upstox feeds have time to populate the freshly-closed candle.
+- **Skips the 9:15 and 15:30 candles** by enforcing a monitor window of `09:20`–`15:25` IST.
+- Outside the window or on weekends/holidays it sleeps until the next trading day's `09:20:07`.
 - Entry can only happen on Wednesday between `15:00` and `15:25`.
 
 ## Upstox API versions
@@ -71,25 +61,64 @@ The bot runs in a candle-aligned loop:
 | Operation | Version | Endpoint |
 |---|---|---|
 | Option chain (with greeks) | v2 | `/v2/option/chain` |
-| Market quote / LTP (spot, VIX) | v2 | `/v2/market-quote/...` |
+| Market quote / LTP / depth | v2 | `/v2/market-quote/...` |
 | **Place order** | **v3** | `/v3/order/place` |
+| **Cancel order** | **v3** | `/v3/order/cancel` |
 | Order details / average price | v2 | `/v2/order/details` |
 | Positions | v2 | `/v2/portfolio/short-term-positions` |
 
-After every order placement (entry, re-deploy, exit) the bot calls `/v2/order/details` until the order is `complete` and uses the returned `average_price` as the leg's true entry / exit price for P&L.
+After every order placement the bot polls `/v2/order/details` until the order is `complete` and uses the returned `average_price` as the leg's true entry / exit price for P&L.
+
+## File layout
+
+```
+config.json              # All tunables (strikes, lot, SL, target, deltas, hedge, limit-order, etc.)
+main.py                  # Runner / scheduler (candle-aligned 5-min ticks)
+strategy.py              # Entry, exit, adjustment logic + strike selection
+upstox_client.py         # Mixed v2/v3 wrapper, limit-with-retry, market-and-fill
+state_manager.py         # JSON state persistence + archive on close
+utils/
+  time_utils.py          # IST clock, Tuesday-expiry math, candle alignment
+  logger.py
+state/
+  active_trade.json      # Live trade. Renamed on close.
+  closed_trades/         # Archive
+```
+
+## Setup & run
+
+```bash
+pip install -r requirements.txt
+export UPSTOX_ACCESS_TOKEN=<your_token>
+python main.py            # live loop (5-min candle-aligned ticks)
+python main.py --once     # single tick
+python main.py --status   # print the active trade JSON
+```
 
 ## State awareness
 
-- On entry, the bot writes `state/active_trade.json` with full leg details and entry baselines.
-- Every monitor tick refreshes prices/deltas, recomputes P&L, evaluates exits and adjustments, and persists the snapshot back to the same file.
-- On close (target / SL / time exit) the file is renamed to
-  `state/closed_trades/<trade_id>_<reason>_<timestamp>.json`.
-- If you restart the bot mid-trade, it picks up the state file automatically and resumes monitoring -- no re-entry will happen while a trade is open.
+- On entry, the bot writes `state/active_trade.json` with full leg details (strike, instrument key, fill price, fill delta, order id) and the entry baselines (`target_pnl`, `stop_loss_pnl`, `capital_deployed`, `entry_credit_per_unit_filled`).
+- Every monitor tick refreshes prices/deltas, recomputes P&L, evaluates exits then adjustments, and persists the snapshot back to the same file.
+- On close the file is renamed to `state/closed_trades/<trade_id>_<reason>_<timestamp>.json`.
+- If you restart the bot mid-trade, it loads the active state and resumes monitoring -- no re-entry while a trade is open.
 
-## Notes / caveats
+## Tunables of note
 
-- **Time-exit semantics.** The user spec says *"Friday 15:00 when expiry is 2 days away"* and also *"max 6 trading sessions"*. With a Wed entry and next-to-next-week Tue expiry, "Friday before expiry" is 8 trading sessions away (Wed,Thu,Fri,Mon,Tue,Wed,Thu,Fri). The bot honors the **Friday-before-expiry 15:00** gate as the primary rule and uses `max_holding_sessions` (default 8) as a safety cap. If you'd rather cap at 6 sessions, set `"max_holding_sessions": 6` in `config.json`.
-- `capital_deployed` in this implementation is approximated as `(spread_width_CE + spread_width_PE) x qty`. Replace with the actual margin returned by Upstox margin API if you need broker-exact sizing.
+| Key | Default | What it controls |
+|---|---|---|
+| `strike_step` | 100 | Strike grid (100 = skip 50-strikes) |
+| `min_delta_floor` | 0.10 | When premium-balancing, never pick a strike below this |Δ| |
+| `premium_balance_tolerance_pct` | 5.0 | Skip premium-rebalancing if CE/PE LTPs are already this close |
+| `limit_max_attempts` | 5 | LIMIT-with-retry attempts before falling back to MARKET |
+| `limit_wait_seconds` | 60 | Wait per attempt before cancel & re-price |
+| `limit_fallback_to_market` | true | If false, the helper gives up after `limit_max_attempts` |
+| `tick_buffer_seconds` | 7 | Delay after each candle close before reading data |
+| `monitor_window_start/end` | 09:20 / 15:25 | The reliable monitor window |
+
+## Caveats
+
+- **Time-exit semantics.** With a Wed entry and next-to-next-week Tue expiry, "Friday before expiry" is 8 trading sessions away (Wed,Thu,Fri,Mon,Tue,Wed,Thu,Fri). The bot honors **Friday-before-expiry 15:00** as the primary gate and uses `max_holding_sessions` (default 8) as a safety cap. Set it to `6` if you want a shorter cap.
+- `capital_deployed` is approximated as `(spread_width_CE + spread_width_PE) × qty`. Replace with Upstox's margin API for broker-exact sizing.
 - Holiday list lives in `utils/time_utils.py` (`NSE_HOLIDAYS_2026`). Update yearly.
-- All orders are placed as `MARKET` `NRML` by default -- change in `config.json` if needed.
-- The bot relies on Upstox option-chain greeks. If your access tier returns no `option_greeks.delta`, plug in your own black-scholes computation in `strategy._normalize_row`.
+- The bot relies on Upstox option-chain `option_greeks.delta`. If your access tier omits it, plug a black-scholes fallback into `strategy._normalize_row`.
+- The Upstox `cancel_order` HTTP path is set to `DELETE /v3/order/cancel?order_id=...`. If your tier exposes a different shape (e.g. `/v3/order/cancel/{id}`), tweak `endpoints.cancel_order` in `config.json`.
