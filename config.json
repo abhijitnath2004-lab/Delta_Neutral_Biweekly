@@ -39,6 +39,8 @@
   "limit_max_attempts": 5,
   "limit_wait_seconds": 60,
   "limit_fallback_to_market": true,
+  "market_max_attempts": 3,
+  "market_wait_seconds": 10,
 
   "upstox": {
     "base_url_v2": "https://api.upstox.com/v2",

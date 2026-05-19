@@ -66,6 +66,8 @@ class DeltaNeutralStrategy:
         self.lim_attempts = int(cfg.get("limit_max_attempts", 5))
         self.lim_wait = int(cfg.get("limit_wait_seconds", 60))
         self.lim_fallback = bool(cfg.get("limit_fallback_to_market", True))
+        self.mkt_attempts = int(cfg.get("market_max_attempts", 3))
+        self.mkt_wait = float(cfg.get("market_wait_seconds", 10))
 
     # =========================================================
     # PUBLIC ENTRY POINT
@@ -309,16 +311,15 @@ class DeltaNeutralStrategy:
             return
 
         # 3) Open new -- LIMIT-with-retry. Hedge first, then short.
-        h_oid, h_fill = self._place_limit_open(new_hedge["instrument_key"], "BUY")
-        s_oid, s_fill = self._place_limit_open(new_short["instrument_key"], "SELL")
+        h_res = self._place_limit_open(new_hedge["instrument_key"], "BUY")
+        s_res = self._place_limit_open(new_short["instrument_key"], "SELL")
 
-        legs[short_key] = self._make_leg(new_short, "SELL", side,
-                                         fill_price=s_fill, order_id=s_oid)
-        legs[hedge_key] = self._make_leg(new_hedge, "BUY", side,
-                                         fill_price=h_fill, order_id=h_oid)
+        legs[short_key] = self._make_leg(new_short, "SELL", side, fill=s_res)
+        legs[hedge_key] = self._make_leg(new_hedge, "BUY",  side, fill=h_res)
         self.state_mgr.append_history(
             state, "SIDE_REDEPLOYED", side=side,
             new_short_strike=new_short["strike"], new_hedge_strike=new_hedge["strike"],
+            short_filled_qty=s_res.filled_qty, hedge_filled_qty=h_res.filled_qty,
         )
 
     # =========================================================
@@ -326,24 +327,24 @@ class DeltaNeutralStrategy:
     # =========================================================
     def _open_iron_condor(self, ce_s, ce_h, pe_s, pe_h) -> Dict[str, Any]:
         # Hedges first (long protection establishes margin), then shorts.
-        ch_oid, ch_fill = self._place_limit_open(ce_h["instrument_key"], "BUY")
-        ph_oid, ph_fill = self._place_limit_open(pe_h["instrument_key"], "BUY")
-        cs_oid, cs_fill = self._place_limit_open(ce_s["instrument_key"], "SELL")
-        ps_oid, ps_fill = self._place_limit_open(pe_s["instrument_key"], "SELL")
+        ch_res = self._place_limit_open(ce_h["instrument_key"], "BUY")
+        ph_res = self._place_limit_open(pe_h["instrument_key"], "BUY")
+        cs_res = self._place_limit_open(ce_s["instrument_key"], "SELL")
+        ps_res = self._place_limit_open(pe_s["instrument_key"], "SELL")
         return {
-            "ce_short": self._make_leg(ce_s, "SELL", "CE", fill_price=cs_fill, order_id=cs_oid),
-            "ce_hedge": self._make_leg(ce_h, "BUY",  "CE", fill_price=ch_fill, order_id=ch_oid),
-            "pe_short": self._make_leg(pe_s, "SELL", "PE", fill_price=ps_fill, order_id=ps_oid),
-            "pe_hedge": self._make_leg(pe_h, "BUY",  "PE", fill_price=ph_fill, order_id=ph_oid),
+            "ce_short": self._make_leg(ce_s, "SELL", "CE", fill=cs_res),
+            "ce_hedge": self._make_leg(ce_h, "BUY",  "CE", fill=ch_res),
+            "pe_short": self._make_leg(pe_s, "SELL", "PE", fill=ps_res),
+            "pe_hedge": self._make_leg(pe_h, "BUY",  "PE", fill=ph_res),
         }
 
-    def _place_limit_open(self, instrument_key: str, side: str
-                          ) -> Tuple[Optional[str], Optional[float]]:
+    def _place_limit_open(self, instrument_key: str, side: str):
         return self.client.place_limit_with_retry(
             instrument_key=instrument_key, side=side, quantity=self.qty,
             max_attempts=self.lim_attempts, wait_seconds=self.lim_wait,
             product=self.product, tick_size=self.tick_size,
             fallback_to_market=self.lim_fallback,
+            market_fallback_attempts=self.mkt_attempts,
         )
 
     def _close_all(self, state, reason: str) -> None:
@@ -353,36 +354,50 @@ class DeltaNeutralStrategy:
         self.state_mgr.close_trade(state, reason)
 
     def _close_leg(self, leg: Dict[str, Any]) -> None:
-        """Close a leg with a MARKET order (E + F: closes are always MARKET)."""
+        """Close a leg with a MARKET order (E + F: closes are always MARKET).
+        Tracks partial fills the same way opens do."""
         opp = "BUY" if leg["side"] == "SELL" else "SELL"
         try:
-            oid, fill = self.client.place_market_and_fill(
+            res = self.client.place_market_and_fill(
                 instrument_key=leg["instrument_key"], side=opp, quantity=leg["qty"],
-                product=self.product,
+                product=self.product, max_attempts=self.mkt_attempts,
+                wait_seconds=self.mkt_wait,
             )
-            leg["exit_order_id"] = oid
-            if fill is not None:
-                leg["exit_price"] = fill
+            leg["exit_order_id"] = res.order_id
+            leg["exit_filled_qty"] = res.filled_qty
+            if res.avg_price is not None:
+                leg["exit_price"] = res.avg_price
+            if res.filled_qty < leg["qty"]:
+                self.log.error("Leg %s only partially closed: %d/%d. Manual reconciliation needed.",
+                               leg["instrument_key"], res.filled_qty, leg["qty"])
         except Exception as e:
             self.log.error("Failed to close leg %s: %s", leg["instrument_key"], e)
 
-    def _make_leg(self, picked, side, opt_type,
-                  fill_price: Optional[float] = None,
-                  order_id: Optional[str] = None) -> Dict[str, Any]:
-        # Use real fill price if available; otherwise fall back to LTP at decision.
-        entry = float(fill_price) if fill_price is not None else float(picked["ltp"])
+    def _make_leg(self, picked, side, opt_type, fill=None) -> Dict[str, Any]:
+        """Build a leg dict using the FillResult (preferred) or fall back to LTP.
+        `qty` reflects the ACTUAL filled quantity, which may be less than the
+        intended `self.qty` if all retries failed to fully fill."""
+        if fill is not None and fill.avg_price is not None and fill.filled_qty > 0:
+            entry = float(fill.avg_price)
+            qty = int(fill.filled_qty)
+        else:
+            entry = float(picked["ltp"])
+            qty = self.qty
+        intended = self.qty
         return {
-            "instrument_key": picked["instrument_key"],
-            "tradingsymbol":  picked.get("tradingsymbol", ""),
-            "strike":         picked["strike"],
-            "option_type":    opt_type,
-            "side":           side,
-            "qty":            self.qty,
-            "entry_price":    entry,
-            "entry_delta":    picked["delta"],
-            "current_price":  entry,
-            "current_delta":  picked["delta"],
-            "entry_order_id": order_id,
+            "instrument_key":  picked["instrument_key"],
+            "tradingsymbol":   picked.get("tradingsymbol", ""),
+            "strike":          picked["strike"],
+            "option_type":     opt_type,
+            "side":            side,
+            "qty":             qty,                # actual filled
+            "intended_qty":    intended,           # what we asked for
+            "qty_shortfall":   max(0, intended - qty),
+            "entry_price":     entry,
+            "entry_delta":     picked["delta"],
+            "current_price":   entry,
+            "current_delta":   picked["delta"],
+            "entry_order_id":  fill.order_id if fill else None,
         }
 
     # =========================================================

@@ -9,19 +9,31 @@ Endpoint -> version mapping (driven by config.upstox.endpoints):
   GET    /v2/order/details                      order status + average_price
   GET    /v2/portfolio/short-term-positions     positions
 
+Both `place_limit_with_retry` and `place_market_and_fill` track partial fills
+across attempts. They keep placing follow-up orders for the remaining quantity
+until the full target is filled or `max_attempts` is exhausted, then return a
+weighted-average price + the final filled quantity.
+
 Docs: https://upstox.com/developer/api-documentation/
 """
 from __future__ import annotations
 
 import os
 import time as _time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import requests
 
 
 class UpstoxError(RuntimeError):
     pass
+
+
+class FillResult(NamedTuple):
+    """Outcome of a (potentially multi-attempt) order placement."""
+    order_id: Optional[str]      # last order_id involved
+    avg_price: Optional[float]   # weighted-average fill price across all fills
+    filled_qty: int              # total filled quantity across all attempts
 
 
 class UpstoxClient:
@@ -116,7 +128,6 @@ class UpstoxClient:
             return None, None
         if not data:
             return None, None
-        # Server may key the response by instrument_key or by token; just take first.
         q = next(iter(data.values()))
         depth = q.get("depth") or {}
         buys = depth.get("buy") or []
@@ -152,7 +163,7 @@ class UpstoxClient:
     def place_order(
         self,
         instrument_key: str,
-        side: str,                 # "BUY" or "SELL"
+        side: str,
         quantity: int,
         order_type: str = "MARKET",
         product: str = "D",
@@ -190,47 +201,123 @@ class UpstoxClient:
         return data.get("data") or {}
 
     # =========================================================
-    # orders -- high level (used by strategy)
+    # orders -- helpers
     # =========================================================
-    def _wait_for_fill(self, order_id: str, timeout_seconds: float,
-                       poll_interval: float = 2.0) -> Tuple[str, Optional[float]]:
-        """Poll order details until terminal status or timeout.
-        Returns (status, average_price_or_None). Status is one of:
-            'complete', 'rejected', 'cancelled', 'pending'.
-        """
+    def _wait_for_terminal(self, order_id: str, timeout_seconds: float,
+                           poll_interval: float = 2.0) -> str:
+        """Poll order details until terminal status (complete/rejected/cancelled)
+        or timeout. Returns the last-seen status (or 'pending')."""
         deadline = _time.time() + float(timeout_seconds)
+        last_status = "pending"
         while _time.time() < deadline:
             try:
                 od = self.get_order_details(order_id)
                 status = (od.get("status") or od.get("order_status") or "").lower()
-                avg = od.get("average_price")
-                if status == "complete":
-                    return ("complete", float(avg) if avg is not None else None)
-                if status in ("rejected", "cancelled"):
-                    return (status, None)
+                last_status = status or last_status
+                if status in ("complete", "rejected", "cancelled"):
+                    return status
             except Exception as e:
-                self.log.warning("get_order_details(%s) failed: %s", order_id, e)
+                self.log.warning("[%s] order detail poll failed: %s", order_id, e)
             _time.sleep(poll_interval)
-        return ("pending", None)
+        return last_status
 
-    def place_market_and_fill(self, **kwargs) -> Tuple[Optional[str], Optional[float]]:
-        """Place a MARKET order (v3) and resolve the average fill price (v2)."""
-        kwargs["order_type"] = "MARKET"
-        kwargs["price"] = 0.0
-        resp = self.place_order(**kwargs)
-        order_id = self._extract_order_id(resp)
-        if not order_id:
-            self.log.error("place_market_and_fill: no order_id in response %s", resp)
-            return None, None
-        status, avg = self._wait_for_fill(
-            order_id,
-            timeout_seconds=self._fill_attempts * self._fill_delay * 4,
-            poll_interval=self._fill_delay,
-        )
-        if status != "complete":
-            self.log.warning("MARKET order %s did not complete in time (status=%s)",
-                             order_id, status)
-        return order_id, avg
+    def _fetch_summary(self, order_id: str
+                       ) -> Tuple[str, Optional[float], int]:
+        """Fetch (status, average_price, filled_quantity) for an order.
+        Tolerates field-name variation across Upstox versions."""
+        try:
+            od = self.get_order_details(order_id)
+        except Exception as e:
+            self.log.warning("[%s] summary fetch failed: %s", order_id, e)
+            return ("unknown", None, 0)
+        status = (od.get("status") or od.get("order_status") or "unknown").lower()
+        avg = od.get("average_price")
+        filled = od.get("filled_quantity")
+        if filled is None:
+            filled = od.get("filled_qty")
+        try:
+            avg_f = float(avg) if avg is not None else None
+        except (TypeError, ValueError):
+            avg_f = None
+        try:
+            qty_i = int(filled) if filled is not None else 0
+        except (TypeError, ValueError):
+            qty_i = 0
+        return (status, avg_f, qty_i)
+
+    # =========================================================
+    # orders -- high level
+    # =========================================================
+    def place_market_and_fill(
+        self,
+        instrument_key: str,
+        side: str,
+        quantity: int,
+        product: str = "D",
+        tag: str = "delta_neutral",
+        max_attempts: int = 3,
+        wait_seconds: float = 10.0,
+    ) -> FillResult:
+        """Place a MARKET order. If the broker reports a partial fill, place
+        further MARKET orders for the remainder until fully filled or
+        `max_attempts` is reached."""
+        target = int(quantity)
+        total_filled = 0
+        weighted_cost = 0.0
+        last_oid: Optional[str] = None
+
+        for attempt in range(1, max_attempts + 1):
+            remaining = target - total_filled
+            if remaining <= 0:
+                break
+
+            self.log.info("[%s] MARKET attempt %d/%d  side=%s qty=%d (filled %d/%d)",
+                          instrument_key, attempt, max_attempts, side,
+                          remaining, total_filled, target)
+            try:
+                resp = self.place_order(
+                    instrument_key=instrument_key, side=side, quantity=remaining,
+                    order_type="MARKET", price=0.0, product=product, tag=tag,
+                )
+            except Exception as e:
+                self.log.error("[%s] MARKET place failed: %s", instrument_key, e)
+                continue
+
+            order_id = self._extract_order_id(resp)
+            if not order_id:
+                self.log.error("[%s] No order_id in MARKET response: %s",
+                               instrument_key, resp)
+                continue
+            last_oid = order_id
+
+            self._wait_for_terminal(order_id, timeout_seconds=wait_seconds,
+                                    poll_interval=1.0)
+            status, avg, fqty = self._fetch_summary(order_id)
+
+            if fqty > 0:
+                if avg is None:
+                    self.log.warning("[%s] order %s filled %d but no avg_price",
+                                     instrument_key, order_id, fqty)
+                else:
+                    weighted_cost += fqty * avg
+                total_filled += fqty
+                self.log.info("[%s] MARKET fill: order=%s qty=%d avg=%.2f (cumulative %d/%d)",
+                              instrument_key, order_id, fqty, avg or 0.0,
+                              total_filled, target)
+                if status == "complete" and total_filled >= target:
+                    break
+            else:
+                self.log.warning("[%s] MARKET order %s ended with status=%s, no fill.",
+                                 instrument_key, order_id, status)
+
+        if total_filled < target:
+            self.log.error(
+                "[%s] MARKET partially filled: %d/%d after %d attempts.",
+                instrument_key, total_filled, target, max_attempts,
+            )
+
+        avg_out = (weighted_cost / total_filled) if total_filled > 0 else None
+        return FillResult(last_oid, avg_out, total_filled)
 
     # Backward-compat alias
     place_and_fill = place_market_and_fill
@@ -246,38 +333,48 @@ class UpstoxClient:
         tag: str = "delta_neutral",
         tick_size: float = 0.05,
         fallback_to_market: bool = True,
-    ) -> Tuple[Optional[str], Optional[float]]:
+        market_fallback_attempts: int = 3,
+    ) -> FillResult:
         """Open a position via LIMIT at the bid-ask mid; if not filled within
-        `wait_seconds`, cancel and re-place with a refreshed mid.
+        `wait_seconds`, cancel and re-place with a refreshed mid for the
+        REMAINING quantity (so partial fills are not lost). After `max_attempts`,
+        fall back to MARKET for any unfilled remainder if `fallback_to_market`.
 
-        After `max_attempts` unfilled tries, optionally fall back to a MARKET
-        order so execution is guaranteed (`fallback_to_market`).
-
-        Returns (order_id, average_fill_price).
+        Returns FillResult(order_id, weighted_avg_price, filled_qty).
         """
-        last_order_id = None
+        target = int(quantity)
+        total_filled = 0
+        weighted_cost = 0.0
+        last_oid: Optional[str] = None
+
         for attempt in range(1, max_attempts + 1):
+            remaining = target - total_filled
+            if remaining <= 0:
+                break
+
             bid, ask = self.get_bid_ask(instrument_key)
             if not bid or not ask or bid <= 0 or ask <= 0 or ask < bid:
-                self.log.warning("[%s] No usable bid/ask (bid=%s ask=%s); breaking to MARKET fallback.",
-                                 instrument_key, bid, ask)
+                self.log.warning(
+                    "[%s] No usable bid/ask (bid=%s ask=%s); breaking out for MARKET fallback.",
+                    instrument_key, bid, ask,
+                )
                 break
 
             limit_price = self._round_to_tick((bid + ask) / 2.0, tick_size)
-            # For SELL, ensure limit >= bid; for BUY, ensure limit <= ask
             if side.upper() == "SELL":
                 limit_price = max(limit_price, self._round_to_tick(bid, tick_size))
             else:
                 limit_price = min(limit_price, self._round_to_tick(ask, tick_size))
 
             self.log.info(
-                "[%s] LIMIT attempt %d/%d  side=%s qty=%d  bid=%.2f ask=%.2f -> px=%.2f",
-                instrument_key, attempt, max_attempts, side, quantity, bid, ask, limit_price,
+                "[%s] LIMIT attempt %d/%d  side=%s qty=%d (filled %d/%d)  bid=%.2f ask=%.2f -> px=%.2f",
+                instrument_key, attempt, max_attempts, side, remaining,
+                total_filled, target, bid, ask, limit_price,
             )
 
             try:
                 resp = self.place_order(
-                    instrument_key=instrument_key, side=side, quantity=quantity,
+                    instrument_key=instrument_key, side=side, quantity=remaining,
                     order_type="LIMIT", product=product, price=limit_price, tag=tag,
                 )
             except Exception as e:
@@ -286,47 +383,77 @@ class UpstoxClient:
 
             order_id = self._extract_order_id(resp)
             if not order_id:
-                self.log.error("[%s] No order_id in response: %s", instrument_key, resp)
+                self.log.error("[%s] No order_id in LIMIT response: %s",
+                               instrument_key, resp)
                 continue
-            last_order_id = order_id
+            last_oid = order_id
 
-            status, avg = self._wait_for_fill(order_id, timeout_seconds=wait_seconds,
-                                              poll_interval=2.0)
-            if status == "complete":
-                self.log.info("[%s] LIMIT filled: order_id=%s avg=%.2f",
-                              instrument_key, order_id, avg if avg else -1)
-                return order_id, avg
+            status_at_timeout = self._wait_for_terminal(
+                order_id, timeout_seconds=wait_seconds, poll_interval=2.0,
+            )
 
-            # Not filled: cancel and retry with a fresh mid
-            self.log.info("[%s] Status=%s after %ds; cancelling %s and retrying.",
-                          instrument_key, status, wait_seconds, order_id)
-            try:
-                self.cancel_order(order_id)
-            except Exception as e:
-                self.log.warning("[%s] cancel_order failed: %s", instrument_key, e)
+            if status_at_timeout != "complete":
+                # Cancel so we can re-price; partial fill (if any) is preserved
+                # by the broker -- we'll capture it from the post-cancel summary.
+                self.log.info("[%s] Status=%s after %ds; cancelling %s.",
+                              instrument_key, status_at_timeout, wait_seconds, order_id)
+                try:
+                    self.cancel_order(order_id)
+                except Exception as e:
+                    self.log.warning("[%s] cancel_order failed: %s", instrument_key, e)
+                _time.sleep(1.0)  # let cancel propagate
 
-            # Race guard: order may have completed between the wait expiring and the cancel
-            try:
-                final = self.get_order_details(order_id)
-                fstatus = (final.get("status") or final.get("order_status") or "").lower()
-                if fstatus == "complete":
-                    avg = final.get("average_price")
-                    self.log.info("[%s] Race: order completed during cancel; avg=%s",
-                                  instrument_key, avg)
-                    return order_id, float(avg) if avg is not None else None
-            except Exception:
-                pass
+            # Fetch authoritative final state for THIS order
+            final_status, final_avg, final_fqty = self._fetch_summary(order_id)
 
-        if fallback_to_market:
+            if final_fqty > 0:
+                if final_avg is None:
+                    self.log.warning(
+                        "[%s] order %s filled %d but no avg_price reported",
+                        instrument_key, order_id, final_fqty,
+                    )
+                else:
+                    weighted_cost += final_fqty * final_avg
+                total_filled += final_fqty
+                self.log.info(
+                    "[%s] LIMIT fill: order=%s qty=%d avg=%.2f (cumulative %d/%d, status=%s)",
+                    instrument_key, order_id, final_fqty, final_avg or 0.0,
+                    total_filled, target, final_status,
+                )
+
+            if total_filled >= target:
+                break
+
+            if final_status == "rejected":
+                self.log.warning("[%s] order %s rejected; retrying with fresh price.",
+                                 instrument_key, order_id)
+                continue
+
+        # Fallback to MARKET for any remainder
+        remaining = target - total_filled
+        if remaining > 0 and fallback_to_market:
             self.log.warning(
-                "[%s] LIMIT retries exhausted; falling back to MARKET for %s qty=%d.",
-                instrument_key, side, quantity,
+                "[%s] LIMIT retries exhausted; MARKET fallback for remaining %d/%d.",
+                instrument_key, remaining, target,
             )
-            return self.place_market_and_fill(
-                instrument_key=instrument_key, side=side, quantity=quantity,
-                product=product, tag=tag,
+            mres = self.place_market_and_fill(
+                instrument_key=instrument_key, side=side, quantity=remaining,
+                product=product, tag=tag, max_attempts=market_fallback_attempts,
             )
-        return last_order_id, None
+            if mres.order_id:
+                last_oid = mres.order_id
+            if mres.filled_qty > 0 and mres.avg_price is not None:
+                weighted_cost += mres.filled_qty * mres.avg_price
+                total_filled += mres.filled_qty
+
+        if total_filled < target:
+            self.log.error(
+                "[%s] PARTIAL FILL ONLY: %d/%d after all attempts (LIMIT + MARKET fallback).",
+                instrument_key, total_filled, target,
+            )
+
+        avg_out = (weighted_cost / total_filled) if total_filled > 0 else None
+        return FillResult(last_oid, avg_out, total_filled)
 
     # =========================================================
     # positions
