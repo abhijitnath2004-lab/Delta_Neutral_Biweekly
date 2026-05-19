@@ -55,9 +55,10 @@ class DeltaNeutralStrategy:
     # PUBLIC ENTRY POINTS
     # =========================================================
     def run_once(self) -> None:
-        """Single tick of the bot. Safe to call repeatedly."""
+        """Single tick of the bot. Safe to call repeatedly.
+        Only runs inside the reliable monitor window (skips 9:15 and 15:30 candles)."""
         now = tu.now_ist()
-        if not tu.is_market_open(now):
+        if not tu.is_in_monitor_window(now):
             return
 
         state = self.state_mgr.load()
@@ -72,7 +73,14 @@ class DeltaNeutralStrategy:
     def _maybe_enter(self, now: datetime) -> None:
         if now.strftime("%A") != self.cfg["entry_day"]:
             return
+        # Entry valid only inside the safe monitor window AND on/after entry_time.
+        # This guards against entering on the unreliable 15:30 candle if we
+        # were ever to be woken late.
         if not tu.at_or_after(now, self.cfg["entry_time"]):
+            return
+        if not tu.is_within(now, self.cfg["entry_time"], self.cfg["monitor_window_end"]):
+            self.log.info("Entry skipped: outside safe entry window %s-%s.",
+                          self.cfg["entry_time"], self.cfg["monitor_window_end"])
             return
 
         vix = self.client.get_india_vix()
@@ -128,6 +136,13 @@ class DeltaNeutralStrategy:
         # ----- place orders: hedges first, then shorts (margin friendly) -----
         legs = self._open_iron_condor(ce_short, ce_hedge, pe_short, pe_hedge)
 
+        # Use ACTUAL fill prices to compute the realized credit booked.
+        actual_credit_per_unit = (
+            legs["ce_short"]["entry_price"] - legs["ce_hedge"]["entry_price"]
+            + legs["pe_short"]["entry_price"] - legs["pe_hedge"]["entry_price"]
+        )
+        actual_credit_total = actual_credit_per_unit * self.qty
+
         state = {
             "trade_id": f"DN_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
             "entry_dt": now.isoformat(),
@@ -140,8 +155,9 @@ class DeltaNeutralStrategy:
             "qty": self.qty,
             "target_pnl": capital_deployed * self.target_pct,
             "stop_loss_pnl": capital_deployed * self.sl_pct,
-            "entry_credit_per_unit": net_credit_per_unit,
-            "entry_credit_total": net_credit_total,
+            "entry_credit_per_unit_quoted": net_credit_per_unit,
+            "entry_credit_per_unit_filled": actual_credit_per_unit,
+            "entry_credit_total_filled":   actual_credit_total,
             "legs": legs,
             "status": "OPEN",
             "close_reason": None,
@@ -149,9 +165,11 @@ class DeltaNeutralStrategy:
         }
         self.state_mgr.save(state)
         self.state_mgr.append_history(state, "TRADE_OPENED",
-                                      credit_per_unit=net_credit_per_unit,
+                                      credit_per_unit_quoted=net_credit_per_unit,
+                                      credit_per_unit_filled=actual_credit_per_unit,
                                       capital_deployed=capital_deployed)
-        self.log.info("Trade opened: %s", state["trade_id"])
+        self.log.info("Trade opened: %s (filled credit/unit=%.2f)",
+                      state["trade_id"], actual_credit_per_unit)
 
     # =========================================================
     # MONITORING
@@ -174,18 +192,23 @@ class DeltaNeutralStrategy:
         self.log.info("Monitor: %s pnl=%.2f target=%.2f sl=%.2f",
                       state["trade_id"], pnl, state["target_pnl"], state["stop_loss_pnl"])
 
-        # ---------- exit gates ----------
+        # ---------- exit gates (priority order) ----------
+        # 1) Target
         if pnl >= state["target_pnl"]:
             self._close_all(state, "TARGET_HIT")
             return
+        # 2) HARD STOP-LOSS -- absolute. No adjustments, no rolls. Square off everything.
         if pnl <= -state["stop_loss_pnl"]:
+            self.log.warning("HARD STOP-LOSS HIT: pnl=%.2f <= -%.2f. Squaring off all legs.",
+                             pnl, state["stop_loss_pnl"])
             self._close_all(state, "STOP_LOSS")
             return
+        # 3) Time exit
         if self._time_exit_due(state, now):
             self._close_all(state, "TIME_EXIT")
             return
 
-        # ---------- adjustments ----------
+        # ---------- adjustments (only run if no exit gate triggered) ----------
         self._check_adjustments(state, chain, chain_index)
 
         # Persist snapshot
@@ -286,15 +309,19 @@ class DeltaNeutralStrategy:
             self.log.error("Re-deploy failed: no %s hedge 200pt away.", side)
             return
 
-        # 3) place new orders (hedge first, then short)
-        self.client.place_order(new_hedge["instrument_key"], "BUY", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
-        self.client.place_order(new_short["instrument_key"], "SELL", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
+        # 3) place new orders (hedge first, then short) -- v3 place + v2 fill
+        h_oid, h_fill = self.client.place_and_fill(
+            instrument_key=new_hedge["instrument_key"], side="BUY",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
+        s_oid, s_fill = self.client.place_and_fill(
+            instrument_key=new_short["instrument_key"], side="SELL",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
 
         # 4) update state (entry baseline for the new short resets)
-        legs[short_key] = self._make_leg(new_short, "SELL", side)
-        legs[hedge_key] = self._make_leg(new_hedge, "BUY", side)
+        legs[short_key] = self._make_leg(new_short, "SELL", side,
+                                          fill_price=s_fill, order_id=s_oid)
+        legs[hedge_key] = self._make_leg(new_hedge, "BUY", side,
+                                          fill_price=h_fill, order_id=h_oid)
         self.state_mgr.append_history(state, "SIDE_REDEPLOYED", side=side,
                                       new_short_strike=new_short["strike"],
                                       new_hedge_strike=new_hedge["strike"])
@@ -304,19 +331,23 @@ class DeltaNeutralStrategy:
     # =========================================================
     def _open_iron_condor(self, ce_s, ce_h, pe_s, pe_h) -> Dict[str, Any]:
         # Hedges first (long protection establishes margin), then shorts.
-        self.client.place_order(ce_h["instrument_key"], "BUY", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
-        self.client.place_order(pe_h["instrument_key"], "BUY", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
-        self.client.place_order(ce_s["instrument_key"], "SELL", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
-        self.client.place_order(pe_s["instrument_key"], "SELL", self.qty,
-                                order_type=self.cfg["order_type"], product=self.cfg["product"])
+        ch_oid, ch_fill = self.client.place_and_fill(
+            instrument_key=ce_h["instrument_key"], side="BUY",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
+        ph_oid, ph_fill = self.client.place_and_fill(
+            instrument_key=pe_h["instrument_key"], side="BUY",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
+        cs_oid, cs_fill = self.client.place_and_fill(
+            instrument_key=ce_s["instrument_key"], side="SELL",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
+        ps_oid, ps_fill = self.client.place_and_fill(
+            instrument_key=pe_s["instrument_key"], side="SELL",
+            quantity=self.qty, order_type=self.cfg["order_type"], product=self.cfg["product"])
         return {
-            "ce_short": self._make_leg(ce_s, "SELL", "CE"),
-            "ce_hedge": self._make_leg(ce_h, "BUY",  "CE"),
-            "pe_short": self._make_leg(pe_s, "SELL", "PE"),
-            "pe_hedge": self._make_leg(pe_h, "BUY",  "PE"),
+            "ce_short": self._make_leg(ce_s, "SELL", "CE", fill_price=cs_fill, order_id=cs_oid),
+            "ce_hedge": self._make_leg(ce_h, "BUY",  "CE", fill_price=ch_fill, order_id=ch_oid),
+            "pe_short": self._make_leg(pe_s, "SELL", "PE", fill_price=ps_fill, order_id=ps_oid),
+            "pe_hedge": self._make_leg(pe_h, "BUY",  "PE", fill_price=ph_fill, order_id=ph_oid),
         }
 
     def _close_all(self, state, reason: str) -> None:
@@ -328,12 +359,20 @@ class DeltaNeutralStrategy:
     def _close_leg(self, leg: Dict[str, Any]) -> None:
         opp = "BUY" if leg["side"] == "SELL" else "SELL"
         try:
-            self.client.place_order(leg["instrument_key"], opp, leg["qty"],
-                                    order_type=self.cfg["order_type"], product=self.cfg["product"])
+            oid, fill = self.client.place_and_fill(
+                instrument_key=leg["instrument_key"], side=opp, quantity=leg["qty"],
+                order_type=self.cfg["order_type"], product=self.cfg["product"])
+            leg["exit_order_id"] = oid
+            if fill is not None:
+                leg["exit_price"] = fill
         except Exception as e:
             self.log.error("Failed to close leg %s: %s", leg["instrument_key"], e)
 
-    def _make_leg(self, picked, side, opt_type) -> Dict[str, Any]:
+    def _make_leg(self, picked, side, opt_type,
+                  fill_price: Optional[float] = None,
+                  order_id: Optional[str] = None) -> Dict[str, Any]:
+        # Use real fill price if available; otherwise fall back to LTP at decision.
+        entry = float(fill_price) if fill_price is not None else float(picked["ltp"])
         return {
             "instrument_key": picked["instrument_key"],
             "tradingsymbol":  picked.get("tradingsymbol", ""),
@@ -341,10 +380,11 @@ class DeltaNeutralStrategy:
             "option_type":    opt_type,
             "side":           side,
             "qty":            self.qty,
-            "entry_price":    picked["ltp"],
+            "entry_price":    entry,
             "entry_delta":    picked["delta"],
-            "current_price":  picked["ltp"],
+            "current_price":  entry,
             "current_delta":  picked["delta"],
+            "entry_order_id": order_id,
         }
 
     # =========================================================

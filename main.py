@@ -2,8 +2,8 @@
 
 Usage:
     export UPSTOX_ACCESS_TOKEN=eyJh...
-    python main.py                  # live loop
-    python main.py --once           # single tick, useful for cron
+    python main.py                  # live loop, candle-aligned 5-min ticks
+    python main.py --once           # single tick
     python main.py --status         # print active trade summary
 
 Designed to be safely killed and restarted -- on restart, if state/active_trade.json
@@ -39,6 +39,18 @@ def cmd_status(cfg, log):
     print(json.dumps(state, indent=2, default=str))
 
 
+def _sleep_until(target, log) -> None:
+    """Sleep in chunks until `target` (timezone-aware datetime). Robust to clock
+    skew and to the process being suspended (e.g. laptop sleep)."""
+    while True:
+        now = tu.now_ist()
+        secs = (target - now).total_seconds()
+        if secs <= 0:
+            return
+        # Cap chunk so a long sleep is interruptible and self-correcting
+        time.sleep(min(secs, 30))
+
+
 def cmd_run(cfg, log, once: bool):
     client = UpstoxClient(cfg, log)
     sm = StateManager(cfg, log)
@@ -48,17 +60,37 @@ def cmd_run(cfg, log, once: bool):
         strat.run_once()
         return
 
-    interval = int(cfg.get("monitor_interval_seconds", 60))
-    log.info("Bot started. Polling every %ds. Ctrl+C to stop.", interval)
+    interval_min = int(cfg.get("monitor_interval_minutes", 5))
+    win_start = tu.parse_hhmm(cfg.get("monitor_window_start", "09:20"))
+    win_end   = tu.parse_hhmm(cfg.get("monitor_window_end",   "15:25"))
+    buffer_s  = int(cfg.get("tick_buffer_seconds", 3))
+
+    log.info(
+        "Bot started. Candle-aligned ticks every %d min, window %s-%s IST (skips 9:15 & 15:30).",
+        interval_min,
+        cfg.get("monitor_window_start", "09:20"),
+        cfg.get("monitor_window_end",   "15:25"),
+    )
+
     while True:
         try:
+            now = tu.now_ist()
+            # If we're already inside the window AND aligned within ~5s of a
+            # candle close, run immediately.
+            if tu.is_in_monitor_window(now) and (now.minute % interval_min == 0) and now.second <= 10:
+                strat.run_once()
+            # Schedule next aligned wake-up
+            nxt = tu.next_candle_tick(now, interval_min, win_start, win_end, buffer_s)
+            log.info("Next tick at %s IST", nxt.strftime("%Y-%m-%d %H:%M:%S"))
+            _sleep_until(nxt, log)
             strat.run_once()
         except KeyboardInterrupt:
             log.info("Bot interrupted by user. State preserved.")
             break
         except Exception as e:
             log.error("Tick failed: %s\n%s", e, traceback.format_exc())
-        time.sleep(interval)
+            # Avoid hot-looping on persistent errors
+            time.sleep(15)
 
 
 def main():

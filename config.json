@@ -29,16 +29,29 @@
   "underlying_instrument_key": "NSE_INDEX|Nifty 50",
   "vix_instrument_key": "NSE_INDEX|India VIX",
   "exchange": "NFO",
-  "product": "NRML",
+  "product": "D",
   "order_type": "MARKET",
 
   "upstox": {
-    "base_url": "https://api.upstox.com/v2",
-    "access_token_env": "UPSTOX_ACCESS_TOKEN"
+    "base_url_v2": "https://api.upstox.com/v2",
+    "base_url_v3": "https://api.upstox.com/v3",
+    "access_token_env": "UPSTOX_ACCESS_TOKEN",
+    "endpoints": {
+      "option_chain":  {"version": "v2", "path": "/option/chain"},
+      "market_quote":  {"version": "v2", "path": "/market-quote/quotes"},
+      "ltp":           {"version": "v2", "path": "/market-quote/ltp"},
+      "place_order":   {"version": "v3", "path": "/order/place"},
+      "order_details": {"version": "v2", "path": "/order/details"},
+      "positions":     {"version": "v2", "path": "/portfolio/short-term-positions"}
+    },
+    "fill_poll_attempts": 5,
+    "fill_poll_delay_seconds": 1.0
   },
 
-  "poll_interval_seconds": 30,
-  "monitor_interval_seconds": 60,
+  "monitor_interval_minutes": 5,
+  "monitor_window_start": "09:20",
+  "monitor_window_end":   "15:25",
+  "tick_buffer_seconds":  3,
 
   "state_file": "state/active_trade.json",
   "closed_trades_dir": "state/closed_trades",

@@ -17,6 +17,8 @@ options via the Upstox v2 API.
 | **Target / SL** | +1% / -1% of deployed capital |
 | **Time exit** | Friday 15:00 (or 6 trading sessions, whichever first) |
 
+> **Hard SL.** The 1% stop-loss is treated as a *hard* kill switch. If breached, **all** legs (both shorts and both hedges) are squared off immediately. No adjustment, no roll, no second-guess.
+
 ### Adjustments
 1. **Premium-double / delta imbalance** -- if one short delta exceeds 2x the other, book that side + its hedge and redeploy at 0.20 delta + 200pt hedge.
 2. **Delta cap 0.35** -- if any short delta crosses 0.35, square off that side + hedge and redeploy at 0.20 delta + 200pt hedge.
@@ -50,10 +52,31 @@ Edit `config.json` to set your `capital`, `num_lots`, etc.
 ## Run
 
 ```bash
-python main.py            # live loop
+python main.py            # live loop (5-min candle-aligned ticks)
 python main.py --once     # single tick (use from cron)
 python main.py --status   # show active trade
 ```
+
+## Scheduling
+
+The bot runs in a candle-aligned loop:
+
+- Wakes up at every 5-minute boundary (`:20, :25, :30, ..., :25:00`) plus a small `tick_buffer_seconds` (default 3s) so Upstox feeds have settled.
+- **Skips the 9:15 and 15:30 candles** by enforcing a monitor window of `09:20`–`15:25` IST. These candles are excluded from both monitoring and entry decisions because their data is unreliable.
+- Outside the window or on weekends/holidays, it sleeps until the next trading day's `09:20`.
+- Entry can only happen on Wednesday between `15:00` and `15:25`.
+
+## Upstox API versions
+
+| Operation | Version | Endpoint |
+|---|---|---|
+| Option chain (with greeks) | v2 | `/v2/option/chain` |
+| Market quote / LTP (spot, VIX) | v2 | `/v2/market-quote/...` |
+| **Place order** | **v3** | `/v3/order/place` |
+| Order details / average price | v2 | `/v2/order/details` |
+| Positions | v2 | `/v2/portfolio/short-term-positions` |
+
+After every order placement (entry, re-deploy, exit) the bot calls `/v2/order/details` until the order is `complete` and uses the returned `average_price` as the leg's true entry / exit price for P&L.
 
 ## State awareness
 

@@ -114,6 +114,11 @@ def friday_before_expiry(expiry: date) -> date:
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
+# Reliable monitoring window. The 9:15 and 15:30 candles are skipped because
+# their data is unreliable on Upstox feeds.
+MONITOR_START = time(9, 20)
+MONITOR_END   = time(15, 25)
+
 
 def is_market_open(dt: datetime | None = None) -> bool:
     dt = dt or now_ist()
@@ -123,6 +128,18 @@ def is_market_open(dt: datetime | None = None) -> bool:
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 
+def is_in_monitor_window(dt: datetime | None = None,
+                         start: time = MONITOR_START,
+                         end: time = MONITOR_END) -> bool:
+    """Window check at minute-resolution so the small post-candle buffer (e.g.
+    15:25:03) still counts as inside the 15:25 candle slot."""
+    dt = dt or now_ist()
+    if not is_trading_day(dt.date()):
+        return False
+    t_min = dt.time().replace(second=0, microsecond=0)
+    return start <= t_min <= end
+
+
 def parse_hhmm(s: str) -> time:
     h, m = s.split(":")
     return time(int(h), int(m))
@@ -130,3 +147,40 @@ def parse_hhmm(s: str) -> time:
 
 def at_or_after(dt: datetime, hhmm: str) -> bool:
     return dt.time() >= parse_hhmm(hhmm)
+
+
+def is_within(dt: datetime, start_hhmm: str, end_hhmm: str) -> bool:
+    return parse_hhmm(start_hhmm) <= dt.time() <= parse_hhmm(end_hhmm)
+
+
+def next_candle_tick(now: datetime,
+                     interval_min: int = 5,
+                     window_start: time = MONITOR_START,
+                     window_end: time = MONITOR_END,
+                     buffer_seconds: int = 3) -> datetime:
+    """Return the next candle-aligned wake-up time within the safe monitor window.
+
+    NSE 5-min candles close on minutes that are multiples of 5 starting from
+    9:15 (so :15, :20, :25, ... ; with `interval_min=5` this is equivalent to
+    `minute % 5 == 0` since 15 % 5 == 0). We add a small buffer so feeds have
+    settled before we read them.
+    """
+    tz = now.tzinfo or IST
+    base = now.replace(second=0, microsecond=0)
+    add = interval_min - (base.minute % interval_min)
+    nxt = base + timedelta(minutes=add)
+    candle_time = nxt.time()        # un-buffered, for window comparison
+    nxt = nxt.replace(second=buffer_seconds)
+
+    # If we landed past today's monitor window or on a non-trading day,
+    # jump to next trading day's window-start.
+    if (not is_trading_day(nxt.date())) or candle_time > window_end:
+        d = next_trading_day(nxt.date())
+        naive = datetime.combine(d, window_start).replace(second=buffer_seconds)
+        return tz.localize(naive) if hasattr(tz, "localize") else naive.replace(tzinfo=tz)
+
+    # Snap up to window-start if we're before market open
+    if candle_time < window_start:
+        return nxt.replace(hour=window_start.hour, minute=window_start.minute,
+                           second=buffer_seconds)
+    return nxt
